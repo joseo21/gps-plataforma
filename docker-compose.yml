@@ -1,0 +1,79 @@
+# Stack GpsSinergy - un solo EC2. PostgreSQL vive en RDS (fuera de compose).
+services:
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      retries: 5
+
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: redis://redis:6379/0
+      CMD_URL: http://ingestor:5028
+      CORS_ORIGINS: ${PUBLIC_ORIGIN}
+      AUTO_CREATE_DEVICES: "1"
+      DEFAULT_TENANT_ID: "1"
+      LOG_LEVEL: INFO
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ingestor:
+    build: ./ingestor
+    environment:
+      API_BASE: http://api:8000
+      REDIS_URL: redis://redis:6379/0
+      TCP_HOST: 0.0.0.0
+      TCP_PORT: "5027"
+      CMD_HOST: 0.0.0.0
+      CMD_PORT: "5028"
+      IDLE_TIMEOUT: "600"
+      FRAME_TIMEOUT: "30"
+      MAX_DATA_LEN: "65536"
+      INGEST_WORKERS: "4"
+      MAX_BACKLOG: "500000"
+      ENFORCE_WHITELIST: "1"
+      # Piloto: guarda el hex crudo para depurar el mapeo de IO.
+      # Bajalo a 5 o a 0 cuando el mapeo este validado.
+      RAW_SAMPLE_PCT: "100"
+      REQUEST_TIMEOUT: "20"
+      LOG_LEVEL: INFO
+    ports:
+      - "5027:5027"     # unico puerto que ven los GPS
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    depends_on:
+      - api
+      - web
+    restart: unless-stopped
+
+volumes:
+  redis-data:
