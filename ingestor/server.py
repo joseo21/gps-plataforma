@@ -442,42 +442,19 @@ def decode_avl_payload(payload: bytes):
 
         gps = {"lat": lat/1e7, "lon": lon/1e7, "alt": alt, "angle": angle,
                "sat": sats, "hdop": None, "speed": float(speed)}
-        io: Dict[str, Any] = {}
 
-        if 0x4E in io_by_size[8]:
-            ib = io_by_size[8][0x4E]; ih = _to_hex_be(ib, 8).upper()
-            if ib != 0:
-                io["IButton"] = ih
-                io["IButton_Reverse"] = _reverse_hex_bytes(ih).upper()
-                io["IButton_Connected"] = True
-            else:
-                io["IButton"] = "0"; io["IButton_Reverse"] = ""; io["IButton_Connected"] = False
-
-        iccid_parts = [_ascii_from_hex(xbytes_map[p]) for p in (0xDB, 0xDC, 0xDD) if p in xbytes_map]
-        if iccid_parts:
-            iccid_full = "".join(iccid_parts).strip("\x00")
-            if iccid_full:
-                io["CCID"] = iccid_full
-                io["CCID Part1"] = _ascii_from_hex(xbytes_map.get(0xDB, ""))
-                io["CCID Part2"] = _ascii_from_hex(xbytes_map.get(0xDC, ""))
-                io["CCID Part3"] = _ascii_from_hex(xbytes_map.get(0xDD, ""))
-
-        raw_numeric = {}
+        # Los IO salen por ID crudo, sin nombrar ni escalar. El nombre, la
+        # escala, el signo y la columna destino los resuelve la API contra
+        # io_definitions segun el modelo del equipo.
+        io_raw: Dict[str, Any] = {}
         for sg in (1, 2, 4, 8):
             for io_id, val in io_by_size[sg].items():
-                raw_numeric[io_id] = val
-                _set_named(io, io_id, val)
+                io_raw[str(io_id)] = val
         for io_id, hv in xbytes_map.items():
-            if io_id not in (0xDB, 0xDC, 0xDD):
-                _set_named(io, io_id, "0x" + hv)
-
-        try:
-            postprocess_record(gps, io, raw_numeric, xbytes_map)
-        except Exception as e:
-            log.debug("postprocess_record fallo: %s", e)
+            io_raw[str(io_id)] = "0x" + hv
 
         records.append({"ts": ts_ms/1000.0, "event_id": event_id, "priority": prio,
-                        "gps": gps, "io": io, "_meta": {"total_io": total_io}})
+                        "gps": gps, "io_raw": io_raw, "_meta": {"total_io": total_io}})
 
     n2, pos = _u8(payload, pos)
     if n2 != n1:

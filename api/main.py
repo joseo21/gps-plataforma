@@ -51,7 +51,8 @@ KEY_ALLOWED = "gps:allowed_imei"
 
 pool: Optional[AsyncConnectionPool] = None
 rds: Optional[aioredis.Redis] = None
-_device_cache: Dict[str, int] = {}
+_device_cache: Dict[str, tuple] = {}
+_io_defs: Dict[str, Dict[int, tuple]] = {}
 
 # Nombres que emite server.py -> columna. Lo que no esta aca va a io_extra.
 IO_A_COLUMNA = {
@@ -65,6 +66,9 @@ IO_A_COLUMNA = {
     # El AVL 87 ("Fuel Level" en el mapa generico) es kilometraje total
     # en equipos con CAN. No se promueve: queda en io_extra intacto.
 }
+
+# Claves redundantes que el parser genera por duplicado.
+DESCARTAR = {"IButton", "IButton_Reverse", "IButton_Connected", "Speed"}
 
 COLS = ["device_id", "ts", "lat_e7", "lon_e7", "speed", "angle", "altitude",
         "sats", "gps_valid", "ignition", "movement", "ext_voltage_cv",
@@ -98,9 +102,10 @@ async def _loop_live_cache():
             async with pool.connection() as conn:
                 cur = await conn.execute(
                     "SELECT d.tenant_id, d.id, d.imei, d.nombre, d.patente, "
-                    "       s.ts, s.lat_e7/1e7, s.lon_e7/1e7, s.speed, s.angle, "
+                    "       s.ts, (s.lat_e7/1e7)::float8, (s.lon_e7/1e7)::float8, "
+                    "       s.speed, s.angle, "
                     "       s.gps_valid, s.ignition, s.movement, "
-                    "       s.ext_voltage_cv/100.0, s.odometer_m, "
+                    "       (s.ext_voltage_cv/100.0)::float8, s.odometer_m, "
                     "       (now() - s.ts) < interval '10 minutes' "
                     "FROM devices d LEFT JOIN device_state s ON s.device_id = d.id "
                     "WHERE d.activo")
@@ -121,6 +126,26 @@ async def _loop_live_cache():
         except Exception as exc:
             log.error("live cache: %s", exc)
         await asyncio.sleep(LIVE_REFRESH_S)
+
+
+async def _loop_io_defs():
+    """Trae io_definitions a memoria. Cambiar un mapeo es un UPDATE."""
+    global _io_defs
+    while True:
+        try:
+            async with pool.connection() as conn:
+                cur = await conn.execute(
+                    "SELECT modelo, avl_id, nombre, escala, tipo, columna, "
+                    "       coalesce(signed,false), bits FROM io_definitions")
+                nuevo: Dict[str, Dict[int, tuple]] = {}
+                for m, aid, nom, esc, tipo, col, sig, bits in await cur.fetchall():
+                    nuevo.setdefault(m, {})[aid] = (nom, float(esc), tipo, col, sig, bits)
+            _io_defs = nuevo
+            _device_cache.clear()
+            log.info("io_definitions: %s", {m: len(d) for m, d in nuevo.items()})
+        except Exception as exc:
+            log.error("io_defs: %s", exc)
+        await asyncio.sleep(60)
 
 
 async def _loop_whitelist():
@@ -148,7 +173,7 @@ async def lifespan(app: FastAPI):
     await pool.open(wait=True)
     rds = aioredis.from_url(REDIS_URL, decode_responses=True)
     tareas = [asyncio.create_task(f()) for f in
-              (_loop_particiones, _loop_live_cache, _loop_whitelist)]
+              (_loop_particiones, _loop_live_cache, _loop_whitelist, _loop_io_defs)]
     log.info("API lista")
     yield
     for t in tareas:
@@ -173,6 +198,7 @@ class Record(BaseModel):
     priority: int = 0
     gps: Optional[Dict[str, Any]] = None
     io: Dict[str, Any] = {}
+    io_raw: Dict[str, Any] = {}
 
 
 class IngestPayload(BaseModel):
@@ -226,6 +252,12 @@ def separar_io(io: Dict[str, Any]):
     cols: Dict[str, Any] = {}
     extra: Dict[str, Any] = {}
     for k, v in io.items():
+        # El parser emite cada valor dos veces: escalado y "_raw". Guardar
+        # ambos en cada registro duplica el jsonb para siempre. El crudo se
+        # puede recalcular desde el escalado y la trama cruda queda en
+        # raw_frames, asi que se descarta.
+        if k.endswith("_raw") or k in DESCARTAR:
+            continue
         destino = IO_A_COLUMNA.get(k)
         if destino is None:
             extra[k] = v
@@ -247,6 +279,61 @@ def separar_io(io: Dict[str, Any]):
             extra[k] = v
         else:
             cols[col] = val
+    return cols, (extra or None)
+
+
+def _con_signo(v: int, bits: int) -> int:
+    mask = (1 << bits) - 1
+    v &= mask
+    return v - (1 << bits) if (v & (1 << (bits - 1))) else v
+
+
+def resolver_io(io_raw: Dict[str, Any], modelo: str):
+    """Traduce {avl_id: crudo} usando el diccionario del modelo. Un ID sin
+    definir se guarda por su numero: nunca se descarta un dato."""
+    porm = _io_defs.get(modelo) or {}
+    gen = _io_defs.get("*") or {}
+    cols: Dict[str, Any] = {}
+    extra: Dict[str, Any] = {}
+    for k, v in io_raw.items():
+        try:
+            aid = int(k)
+        except (TypeError, ValueError):
+            extra[str(k)] = v
+            continue
+        d = porm.get(aid) or gen.get(aid)
+        if d is None:
+            extra[str(aid)] = v
+            continue
+        nombre, escala, tipo, columna, signed, bits = d
+        if isinstance(v, str):
+            val = v
+        elif tipo == "bool":
+            val = bool(v)
+        elif tipo == "hex":
+            val = f"0x{int(v):X}" if v else None
+        else:
+            val = int(v)
+            if signed and bits:
+                val = _con_signo(val, int(bits))
+            if escala != 1:
+                val = val * escala
+        if not columna or val is None or isinstance(val, str):
+            if val is not None:
+                extra[nombre] = val
+            continue
+        if columna.endswith("_cv"):
+            puesto = _clamp(round(val * 100), -32768, 32767)
+        elif columna in ("odometer_m", "fuel_used"):
+            puesto = _clamp(val, -2147483648, 2147483647)
+        elif columna in ("ignition", "movement"):
+            puesto = bool(val)
+        else:
+            puesto = _clamp(val, -32768, 32767)
+        if puesto is None and val is not None:
+            extra[nombre] = val
+        else:
+            cols[columna] = puesto
     return cols, (extra or None)
 
 
@@ -275,24 +362,25 @@ def ts_valido(ts: float, ahora: datetime) -> Optional[datetime]:
     return dt
 
 
-async def resolver_device(conn, imei: str) -> Optional[int]:
+async def resolver_device(conn, imei: str):
+    """Devuelve (device_id, modelo) o None."""
     if imei in _device_cache:
         return _device_cache[imei]
-    cur = await conn.execute("SELECT id FROM devices WHERE imei = %s", (imei,))
+    cur = await conn.execute("SELECT id, modelo FROM devices WHERE imei = %s", (imei,))
     row = await cur.fetchone()
     if row:
-        _device_cache[imei] = row[0]
-        return row[0]
+        _device_cache[imei] = (row[0], row[1] or "*")
+        return _device_cache[imei]
     if not AUTO_CREATE_DEVICES:
         return None
     cur = await conn.execute(
         "INSERT INTO devices (tenant_id, imei, nombre) VALUES (%s,%s,%s) "
-        "ON CONFLICT (imei) DO UPDATE SET imei = EXCLUDED.imei RETURNING id",
+        "ON CONFLICT (imei) DO UPDATE SET imei = EXCLUDED.imei RETURNING id, modelo",
         (DEFAULT_TENANT_ID, imei, f"Teltonika {imei}"))
     row = await cur.fetchone()
-    _device_cache[imei] = row[0]
+    _device_cache[imei] = (row[0], row[1] or "*")
     log.info("Alta automatica: %s", imei)
-    return row[0]
+    return _device_cache[imei]
 
 
 @app.post("/ingest/teltonika/ingest")
@@ -302,6 +390,12 @@ async def ingest(payload: IngestPayload):
         raise HTTPException(400, "IMEI vacio")
 
     ahora = datetime.now(timezone.utc)
+    async with pool.connection() as conn:
+        info = await resolver_device(conn, imei)
+    if info is None:
+        raise HTTPException(403, f"IMEI {imei} no registrado")
+    device_id, modelo = info
+
     filas, descartes = [], 0
 
     for rec in payload.records:
@@ -311,7 +405,10 @@ async def ingest(payload: IngestPayload):
             continue
         gps = rec.gps or {}
         ok = gps_valido(rec.gps)
-        cols, extra = separar_io(rec.io)
+        if rec.io_raw:
+            cols, extra = resolver_io(rec.io_raw, modelo)
+        else:
+            cols, extra = separar_io(rec.io)
         filas.append({
             "ts": dt,
             "lat_e7": int(round(gps["lat"] * 1e7)) if ok else None,
@@ -336,10 +433,6 @@ async def ingest(payload: IngestPayload):
         })
 
     async with pool.connection() as conn:
-        device_id = await resolver_device(conn, imei)
-        if device_id is None:
-            raise HTTPException(403, f"IMEI {imei} no registrado")
-
         if payload.payload_hex:
             await conn.execute(
                 "INSERT INTO raw_frames (imei, codec, payload) VALUES (%s,%s,%s)",
