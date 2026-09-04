@@ -57,7 +57,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS applications_tenant_idx ON applications (tenan
 
 CREATE TABLE IF NOT EXISTS users (
     id              bigserial PRIMARY KEY,
-    email           citext,                       -- ver nota de extension
+    email           text,
     nombre          text        NOT NULL,
     apellido        text,
     password_hash   text        NOT NULL,
