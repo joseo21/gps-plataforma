@@ -61,8 +61,9 @@ IO_A_COLUMNA = {
     "Battery Voltage":  ("bat_voltage_cv", "cv"),
     "Total Odometer":   ("odometer_m",     "int"),
     "GSM Signal":       ("gsm_signal",     "int"),
-    "Fuel Level":       ("fuel_level",     "int"),
     "Fuel Counter":     ("fuel_used",      "int"),
+    # El AVL 87 ("Fuel Level" en el mapa generico) es kilometraje total
+    # en equipos con CAN. No se promueve: queda en io_extra intacto.
 }
 
 COLS = ["device_id", "ts", "lat_e7", "lon_e7", "speed", "angle", "altitude",
@@ -194,6 +195,32 @@ def _bool(v):
     return v if isinstance(v, bool) else (bool(v) if isinstance(v, int) else None)
 
 
+def _clamp(v, lo, hi):
+    """Nunca confiar en el rango de lo que manda un equipo."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return None
+    return v if lo <= v <= hi else None
+
+
+def _alt_i16(v):
+    """La altitud Teltonika es entero de 16 bits CON signo, pero el parser
+    la lee sin signo: 65535 significa -1 metro. Sin esto, cualquier
+    altitud negativa desborda smallint y tumba el lote entero."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return None
+    if v > 32767:
+        v -= 65536
+    return _clamp(v, -32768, 32767)
+
+
 def separar_io(io: Dict[str, Any]):
     """Reparte los IO entre columnas tipadas y el jsonb de sobras."""
     cols: Dict[str, Any] = {}
@@ -206,12 +233,20 @@ def separar_io(io: Dict[str, Any]):
         col, tipo = destino
         if tipo == "bool":
             cols[col] = _bool(v)
-        elif tipo == "cv":
+            continue
+        if tipo == "cv":
             n = _num(v)
-            cols[col] = int(round(n * 100)) if n is not None else None
+            val = _clamp(round(n * 100), -32768, 32767) if n is not None else None
+        elif col in ("odometer_m", "fuel_used"):
+            val = _clamp(_num(v), -2147483648, 2147483647)
         else:
-            n = _num(v)
-            cols[col] = int(n) if n is not None else None
+            val = _clamp(_num(v), -32768, 32767)
+        if val is None and v is not None:
+            # No cabe en la columna: se conserva en io_extra en vez de
+            # perderlo. Casi siempre significa mapeo equivocado.
+            extra[k] = v
+        else:
+            cols[col] = val
     return cols, (extra or None)
 
 
@@ -281,10 +316,10 @@ async def ingest(payload: IngestPayload):
             "ts": dt,
             "lat_e7": int(round(gps["lat"] * 1e7)) if ok else None,
             "lon_e7": int(round(gps["lon"] * 1e7)) if ok else None,
-            "speed": int(gps.get("speed") or 0),
-            "angle": gps.get("angle"),
-            "altitude": gps.get("alt"),
-            "sats": gps.get("sat"),
+            "speed": _clamp(gps.get("speed") or 0, 0, 32767),
+            "angle": _clamp(gps.get("angle"), 0, 32767),
+            "altitude": _alt_i16(gps.get("alt")),
+            "sats": _clamp(gps.get("sat"), 0, 255),
             "gps_valid": ok,
             "ignition": cols.get("ignition"),
             "movement": cols.get("movement"),
@@ -294,9 +329,9 @@ async def ingest(payload: IngestPayload):
             "gsm_signal": cols.get("gsm_signal"),
             "fuel_level": cols.get("fuel_level"),
             "fuel_used": cols.get("fuel_used"),
-            "event_id": rec.event_id,
-            "priority": rec.priority,
-            "lag_s": int((ahora - dt).total_seconds()),
+            "event_id": _clamp(rec.event_id, -2147483648, 2147483647),
+            "priority": _clamp(rec.priority, -32768, 32767),
+            "lag_s": _clamp((ahora - dt).total_seconds(), -2147483648, 2147483647),
             "io_extra": Jsonb(extra) if extra else None,
         })
 
