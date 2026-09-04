@@ -106,7 +106,8 @@ async def _loop_live_cache():
                     "       s.speed, s.angle, "
                     "       s.gps_valid, s.ignition, s.movement, "
                     "       (s.ext_voltage_cv/100.0)::float8, s.odometer_m, "
-                    "       (now() - s.ts) < interval '10 minutes' "
+                    "       (now() - s.ts) < interval '10 minutes', "
+                    "       s.sats, s.gsm_signal, s.fuel_level, s.io_extra "
                     "FROM devices d LEFT JOIN device_state s ON s.device_id = d.id "
                     "WHERE d.activo")
                 por_tenant: Dict[int, List[Dict[str, Any]]] = {}
@@ -118,6 +119,8 @@ async def _loop_live_cache():
                         "gps_valid": r[10], "ignition": r[11], "movement": r[12],
                         "ext_voltage": r[13], "odometer_m": r[14],
                         "online": bool(r[15]),
+                        "sats": r[16], "gsm_signal": r[17],
+                        "fuel_level": r[18], "io_extra": r[19] or {},
                     })
             pipe = rds.pipeline()
             for tid, lista in por_tenant.items():
@@ -456,18 +459,21 @@ async def ingest(payload: IngestPayload):
         n = max(filas, key=lambda f: f["ts"])
         cur = await conn.execute(
             "INSERT INTO device_state (device_id, ts, lat_e7, lon_e7, speed, angle, "
-            " gps_valid, ignition, movement, ext_voltage_cv, odometer_m, io_extra, updated_at) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) "
+            " gps_valid, ignition, movement, ext_voltage_cv, odometer_m, "
+            " sats, gsm_signal, fuel_level, io_extra, updated_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now()) "
             "ON CONFLICT (device_id) DO UPDATE SET "
             "  ts=EXCLUDED.ts, lat_e7=EXCLUDED.lat_e7, lon_e7=EXCLUDED.lon_e7, "
             "  speed=EXCLUDED.speed, angle=EXCLUDED.angle, gps_valid=EXCLUDED.gps_valid, "
             "  ignition=EXCLUDED.ignition, movement=EXCLUDED.movement, "
             "  ext_voltage_cv=EXCLUDED.ext_voltage_cv, odometer_m=EXCLUDED.odometer_m, "
-            "  io_extra=EXCLUDED.io_extra, updated_at=now() "
+            "  sats=EXCLUDED.sats, gsm_signal=EXCLUDED.gsm_signal, "
+            "  fuel_level=EXCLUDED.fuel_level, io_extra=EXCLUDED.io_extra, updated_at=now() "
             "WHERE device_state.ts < EXCLUDED.ts RETURNING device_id",
             (device_id, n["ts"], n["lat_e7"], n["lon_e7"], n["speed"], n["angle"],
              n["gps_valid"], n["ignition"], n["movement"], n["ext_voltage_cv"],
-             n["odometer_m"], n["io_extra"]))
+             n["odometer_m"], n["sats"], n["gsm_signal"], n["fuel_level"],
+             n["io_extra"]))
         actualizado = await cur.fetchone() is not None
 
     if actualizado:
