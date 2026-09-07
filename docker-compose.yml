@@ -16,6 +16,7 @@ services:
     build: ./api
     environment:
       DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
       REDIS_URL: redis://redis:6379/0
       CMD_URL: http://ingestor:5028
       CORS_ORIGINS: ${PUBLIC_ORIGIN}
