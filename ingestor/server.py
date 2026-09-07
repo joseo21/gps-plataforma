@@ -603,14 +603,34 @@ async def ingest_worker(n: int):
 
 
 async def _loop_reclamar():
-    """Recupera mensajes que quedaron colgados de un worker que murio."""
+    """Recupera y PROCESA los mensajes que quedaron colgados de un worker
+    que murio. Reclamarlos sin procesarlos los deja pendientes para
+    siempre: los workers leen con '>' y nunca ven un mensaje reclamado."""
+    consumidor = f"{INSTANCE_ID}-claim"
+    cursor = "0-0"
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
         try:
-            await rds.xautoclaim(STREAM, GROUP, f"{INSTANCE_ID}-claim",
-                                 min_idle_time=120000, count=100)
+            resp = await rds.xautoclaim(STREAM, GROUP, consumidor,
+                                        min_idle_time=120000,
+                                        start_id=cursor, count=500)
+            # redis-py devuelve (siguiente_cursor, mensajes[, borrados])
+            cursor = resp[0] or "0-0"
+            mensajes = resp[1] or []
+            if not mensajes:
+                continue
+            log.info("Reclamados %d mensajes atascados", len(mensajes))
+            for msg_id, campos in mensajes:
+                if not campos:            # mensaje ya borrado del stream
+                    await rds.xack(STREAM, GROUP, msg_id)
+                    continue
+                if await _procesar(msg_id, campos):
+                    await rds.xack(STREAM, GROUP, msg_id)
+                else:
+                    await asyncio.sleep(1)
         except Exception as e:
-            log.debug("xautoclaim: %s", e)
+            log.error("xautoclaim: %s", e)
+            cursor = "0-0"
 
 
 # ── Comandos Codec 12, ruteados por Redis ───────────────────────────────────
